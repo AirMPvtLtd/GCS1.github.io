@@ -1,0 +1,551 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AirM Stark GCS</title>
+    <script src="https://cdn.jsdelivr.net/npm/react@18.2.0/umd/react.development.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/react-dom@18.2.0/umd/react-dom.development.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.22.9/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <style>
+        @keyframes arcPulse {
+            0% { border-color: rgba(255, 75, 0, 0.5); box-shadow: 0 0 10px rgba(255, 75, 0, 0.3); }
+            50% { border-color: rgba(255, 75, 0, 1); box-shadow: 0 0 20px rgba(255, 75, 0, 0.8); }
+            100% { border-color: rgba(255, 75, 0, 0.5); box-shadow: 0 0 10px rgba(255, 75, 0, 0.3); }
+        }
+        @keyframes scan {
+            0% { transform: translateY(-100%); }
+            100% { transform: translateY(100%); }
+        }
+        @keyframes fadeOut {
+            0% { opacity: 1; }
+            100% { opacity: 0; }
+        }
+        .stark-bg {
+            background: linear-gradient(180deg, #0a0f1a 0%, #1a2633 100%);
+            overflow: hidden;
+        }
+        .arc-reactor {
+            border: 2px solid rgba(255, 75, 0, 0.7);
+            box-shadow: 0 0 15px rgba(255, 75, 0, 0.5), inset 0 0 10px rgba(255, 75, 0, 0.3);
+            animation: arcPulse 2s infinite;
+        }
+        .holo-text {
+            text-shadow: 0 0 5px rgba(255, 75, 0, 0.8), 0 0 10px rgba(255, 75, 0, 0.5);
+        }
+        .scan-line {
+            position: absolute;
+            width: 100%;
+            height: 2px;
+            background: rgba(255, 75, 0, 0.3);
+            animation: scan 5s infinite linear;
+        }
+        .hover-arc {
+            transition: all 0.3s ease;
+        }
+        .hover-arc:hover {
+            box-shadow: 0 0 25px rgba(255, 75, 0, 1);
+            transform: scale(1.05);
+        }
+        .confirmation {
+            animation: fadeOut 3s forwards;
+        }
+        #map {
+            height: 200px;
+            border: 1px solid rgba(255, 75, 0, 0.7);
+            border-radius: 4px;
+        }
+        .terminal-log-info {
+            color: #60a5fa; /* Blue for info */
+        }
+        .terminal-log-success {
+            color: #34d399; /* Green for success */
+        }
+        .terminal-log-error {
+            color: #f87171; /* Red for error */
+        }
+    </style>
+</head>
+<body class="stark-bg text-white font-mono min-h-screen relative">
+    <div class="scan-line"></div>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef } = React;
+
+        const GroundControlStation = () => {
+            const [telemetry, setTelemetry] = useState({
+                roll: 0, pitch: 0, yaw: 0, throttle: 0, height: 0, x: 0, y: 0, battery: 100,
+                m1: 0, m2: 0, m3: 0, m4: 0, warnings: []
+            });
+            const [displayLogs, setDisplayLogs] = useState([]);
+            const [fullLogs, setFullLogs] = useState([]);
+            const [processLogs, setProcessLogs] = useState([]);
+            const [port, setPort] = useState(null);
+            const [socket, setSocket] = useState(null);
+            const [connectionType, setConnectionType] = useState(null);
+            const [wifiStatus, setWifiStatus] = useState("Not Connected");
+            const [modeConfirmation, setModeConfirmation] = useState(null);
+            const [motorTrim, setMotorTrim] = useState([0, 0, 0, 0]);
+            const [pidGains, setPidGains] = useState({
+                roll: { kp: 1.0, ki: 0.05, kd: 0.2 },
+                pitch: { kp: 1.0, ki: 0.05, kd: 0.2 },
+                yaw: { kp: 0.5, ki: 0.01, kd: 0.1 },
+                height: { kp: 2.0, ki: 0.1, kd: 0.5 }
+            });
+            const [mpuStatus, setMpuStatus] = useState("Unknown");
+            const [missionTime, setMissionTime] = useState(0);
+            const terminalRef = useRef(null);
+
+            // Process Logging
+            const logProcess = (message, type = 'info') => {
+                const timestamp = new Date().toLocaleTimeString();
+                setProcessLogs(prev => [...prev, { timestamp, message, type }].slice(-100));
+                console.log(`[${timestamp}] ${type.toUpperCase()}: ${message}`);
+                // Auto-scroll terminal
+                if (terminalRef.current) {
+                    terminalRef.current.scrollTop = terminalRef.current.scrollHeight;
+                }
+            };
+
+            // Mission Timer
+            useEffect(() => {
+                const timer = setInterval(() => {
+                    setMissionTime(prev => prev + 1);
+                }, 1000);
+                return () => clearInterval(timer);
+            }, []);
+
+            // Map Initialization
+            useEffect(() => {
+                const map = L.map('map').setView([0, 0], 13);
+                L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                    attribution: '© OpenStreetMap'
+                }).addTo(map);
+                const marker = L.marker([telemetry.x, telemetry.y]).addTo(map);
+                map.setView([telemetry.x, telemetry.y], 13);
+                marker.setLatLng([telemetry.x, telemetry.y]);
+                return () => map.remove();
+            }, [telemetry.x, telemetry.y]);
+
+            // Connect via USB (WebSerial)
+            const connectUSB = async () => {
+                logProcess("USB: Requesting serial port", "info");
+                try {
+                    const serialPort = await navigator.serial.requestPort();
+                    logProcess("USB: Serial port selected", "success");
+                    logProcess("USB: Opening port with baud rate 115200", "info");
+                    await serialPort.open({ baudRate: 115200 });
+                    logProcess("USB: Port opened successfully", "success");
+                    setPort(serialPort);
+                    setConnectionType("USB");
+                    readFromPort(serialPort);
+                } catch (error) {
+                    logProcess(`USB: Connection failed - ${error.message}`, "error");
+                    console.error("USB Connection failed:", error);
+                }
+            };
+
+            // Connect via WiFi (WebSocket to Proxy)
+            const connectWiFi = () => {
+                logProcess("WiFi: Connecting to proxy at ws://localhost:8081", "info");
+                const ws = new WebSocket('ws://localhost:8081');
+                ws.onopen = () => {
+                    logProcess("WiFi: Connection successful, sending ping", "success");
+                    setSocket(ws);
+                    setConnectionType("WiFi");
+                    setWifiStatus("Connected");
+                    ws.send("ping");
+                    setInterval(() => {
+                        logProcess("WiFi: Requesting logs from drone", "info");
+                        ws.send("get_logs");
+                    }, 5000);
+                };
+                ws.onmessage = (event) => {
+                    logProcess(`WiFi: Received data - ${event.data.slice(0, 50)}...`, "info");
+                    handleData(event.data);
+                };
+                ws.onerror = (error) => {
+                    logProcess("WiFi: WebSocket error occurred", "error");
+                    console.error("WebSocket Error:", error);
+                    setWifiStatus("Problem: Connection Lost");
+                };
+                ws.onclose = (event) => {
+                    logProcess(`WiFi: WebSocket closed (code: ${event.code}, reason: ${event.reason || 'unknown'})`, "error");
+                    setConnectionType(null);
+                    setWifiStatus("Problem: Not Connected");
+                };
+            };
+
+            // Read from USB port
+            const readFromPort = async (serialPort) => {
+                logProcess("USB: Initializing serial reader", "info");
+                const reader = serialPort.readable.getReader();
+                try {
+                    while (true) {
+                        logProcess("USB: Reading data from port", "info");
+                        const { value, done } = await reader.read();
+                        if (done) {
+                            logProcess("USB: Serial reader done", "info");
+                            break;
+                        }
+                        const data = new TextDecoder().decode(value).trim();
+                        logProcess(`USB: Received data - ${data.slice(0, 50)}...`, "info");
+                        handleData(data);
+                    }
+                } catch (error) {
+                    logProcess(`USB: Read error - ${error.message}`, "error");
+                    console.error("Read error:", error);
+                    setConnectionType(null);
+                } finally {
+                    logProcess("USB: Releasing reader lock", "info");
+                    reader.releaseLock();
+                }
+            };
+
+            // Handle incoming data
+            const handleData = (data) => {
+                logProcess("Processing: Parsing incoming data", "info");
+                try {
+                    if (data.includes("Roll:")) {
+                        logProcess("Processing: Parsing telemetry data", "info");
+                        const parsed = parseTelemetry(data);
+                        setTelemetry(parsed);
+                        logProcess("Processing: Telemetry updated successfully", "success");
+                    } else if (data.includes("[")) {
+                        logProcess("Processing: Parsing log data", "info");
+                        const newLogs = data.split("\n").filter(line => line.trim());
+                        setDisplayLogs(prev => [...prev, ...newLogs].slice(-20));
+                        setFullLogs(prev => [...prev, ...newLogs].slice(-1000));
+                        logProcess("Processing: Logs updated successfully", "success");
+                        newLogs.forEach(log => {
+                            if (log.includes("Trim completed")) {
+                                const trimMatch = log.match(/Trim completed: \[(-?\d+), (-?\d+), (-?\d+), (-?\d+)\]/);
+                                if (trimMatch) {
+                                    setMotorTrim([parseInt(trimMatch[1]), parseInt(trimMatch[2]), parseInt(trimMatch[3]), parseInt(trimMatch[4])]);
+                                    logProcess("Processing: Motor trim updated", "success");
+                                }
+                            }
+                            if (log.includes("Reducing kp")) {
+                                const axisMatch = log.match(/High (Roll|Pitch) oscillation/);
+                                if (axisMatch) {
+                                    const axis = axisMatch[1].toLowerCase();
+                                    setPidGains(prev => ({
+                                        ...prev,
+                                        [axis]: { ...prev[axis], kp: Math.max(prev[axis].kp * 0.9, 0.1) }
+                                    }));
+                                    logProcess(`Processing: ${axis} PID kp reduced`, "success");
+                                }
+                            } else if (log.includes("Adjusting height PID")) {
+                                setPidGains(prev => ({
+                                    ...prev,
+                                    height: { ...prev.height, kp: prev.height.kp * 1.1 }
+                                }));
+                                logProcess("Processing: Height PID kp adjusted", "success");
+                            }
+                            if (log.includes("Calibration")) {
+                                const statusMatch = log.match(/Calibration (Successful|Failed)/);
+                                if (statusMatch) {
+                                    setMpuStatus(statusMatch[1]);
+                                    logProcess(`Processing: MPU6050 calibration ${statusMatch[1].toLowerCase()}`, statusMatch[1] === "Successful" ? "success" : "error");
+                                }
+                            }
+                        });
+                    } else {
+                        logProcess(`Processing: Unrecognized data - ${data.slice(0, 50)}...`, "error");
+                    }
+                } catch (error) {
+                    logProcess(`Processing: Data parsing failed - ${error.message}`, "error");
+                }
+            };
+
+            // Parse telemetry string
+            const parseTelemetry = (data) => {
+                logProcess("Telemetry: Splitting data into parts", "info");
+                const parts = data.split(", ");
+                const result = {};
+                parts.forEach(part => {
+                    const [key, value] = part.split(":");
+                    if (key === "Warnings") {
+                        result.warnings = value.split(";");
+                        logProcess("Telemetry: Parsed warnings", "info");
+                    } else {
+                        result[key.toLowerCase()] = parseFloat(value) || value;
+                        logProcess(`Telemetry: Parsed ${key.toLowerCase()} = ${value}`, "info");
+                    }
+                });
+                result.m1 = result.m1 || 0;
+                result.m2 = result.m2 || 0;
+                result.m3 = result.m3 || 0;
+                result.m4 = result.m4 || 0;
+                logProcess("Telemetry: Parsing completed", "success");
+                return result;
+            };
+
+            // Send command
+            const sendCommand = async (command) => {
+                logProcess(`Command: Preparing command - ${command}`, "info");
+                try {
+                    if (connectionType === "USB" && port) {
+                        logProcess("Command: Sending via USB", "info");
+                        const writer = port.writable.getWriter();
+                        await writer.write(new TextEncoder().encode(command + "\n"));
+                        writer.releaseLock();
+                        logProcess("Command: Sent via USB successfully", "success");
+                    } else if (connectionType === "WiFi" && socket) {
+                        logProcess("Command: Sending via WiFi", "info");
+                        socket.send(command);
+                        logProcess("Command: Sent via WiFi successfully", "success");
+                    } else {
+                        logProcess("Command: No active connection", "error");
+                        return;
+                    }
+                    if (["Sluggish", "Neutral", "Agile"].includes(command)) {
+                        setModeConfirmation(`Mode Set: ${command}`);
+                        logProcess(`Command: Mode confirmation displayed - ${command}`, "success");
+                        setTimeout(() => {
+                            setModeConfirmation(null);
+                            logProcess("Command: Mode confirmation cleared", "info");
+                        }, 3000);
+                    }
+                } catch (error) {
+                    logProcess(`Command: Failed to send - ${error.message}`, "error");
+                }
+            };
+
+            // Fetch logs
+            const fetchLogs = () => {
+                logProcess("Logs: Initiating log fetch", "info");
+                sendCommand("get_logs");
+            };
+
+            // Download logfile
+            const downloadLog = () => {
+                logProcess("Logs: Preparing log download", "info");
+                const now = new Date();
+                const timestamp = now.getFullYear() + String(now.getMonth() + 1).padStart(2, '0') +
+                                 String(now.getDate()).padStart(2, '0') + '_' +
+                                 String(now.getHours()).padStart(2, '0') + String(now.getMinutes()).padStart(2, '0') +
+                                 String(now.getSeconds()).padStart(2, '0');
+                const logContent = fullLogs.join('\n');
+                const blob = new Blob([logContent], { type: 'text/plain' });
+                const url = window.URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `AirM_Log_${timestamp}.txt`;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                window.URL.revokeObjectURL(url);
+                logProcess("Logs: Log file downloaded", "success");
+            };
+
+            // Format mission time
+            const formatTime = (seconds) => {
+                const h = Math.floor(seconds / 3600).toString().padStart(2, '0');
+                const m = Math.floor((seconds % 3600) / 60).toString().padStart(2, '0');
+                const s = (seconds % 60).toString().padStart(2, '0');
+                return `${h}:${m}:${s}`;
+            };
+
+            useEffect(() => {
+                return () => {
+                    if (port) {
+                        logProcess("Cleanup: Closing USB port", "info");
+                        port.close();
+                    }
+                    if (socket) {
+                        logProcess("Cleanup: Closing WebSocket", "info");
+                        socket.close();
+                    }
+                };
+            }, [port, socket]);
+
+            return (
+                <div className="container mx-auto p-6 relative z-10">
+                    {/* Header */}
+                    <header className="text-center mb-8">
+                        <h1 className="text-5xl font-bold holo-text">AirM Stark</h1>
+                        <p className="text-lg text-orange-400 mt-2">Repulsor Control System</p>
+                        <p className="text-sm text-orange-400 mt-1">Mission Time: {formatTime(missionTime)}</p>
+                        <div className="mt-4 flex justify-center space-x-4">
+                            <button
+                                onClick={connectUSB}
+                                disabled={connectionType}
+                                className={`px-6 py-2 rounded-full holo-text hover-arc ${connectionType === "USB" ? 'bg-orange-600' : 'bg-gray-800 border border-orange-400'}`}
+                            >
+                                {connectionType === "USB" ? "USB Engaged" : "Activate USB"}
+                            </button>
+                            <button
+                                onClick={connectWiFi}
+                                disabled={connectionType}
+                                className={`px-6 py-2 rounded-full holo-text hover-arc ${connectionType === "WiFi" ? 'bg-orange-600' : 'bg-gray-800 border border-orange-400'}`}
+                            >
+                                {connectionType === "WiFi" ? "WiFi Engaged" : "Activate WiFi"}
+                            </button>
+                        </div>
+                        <p className={`mt-2 text-sm ${wifiStatus === "Connected" ? "text-orange-400" : "text-red-400"}`}>
+                            WiFi Status: {wifiStatus}
+                        </p>
+                    </header>
+
+                    {/* Main Dashboard */}
+                    <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                        {/* Control Panel */}
+                        <section className="bg-gray-800 bg-opacity-70 p-6 rounded-lg arc-reactor h-[calc(100vh-180px)] overflow-y-auto">
+                            <h2 className="text-xl holo-text mb-4 text-center">Flight Controls</h2>
+                            <div className="space-y-3">
+                                <div className="flex justify-between gap-2">
+                                    <button onClick={() => sendCommand("Throttle Up")} className="flex-1 px-4 py-2 holo-text hover-arc bg-gray-700 rounded-full">Thrusters Up</button>
+                                    <button onClick={() => sendCommand("Throttle Down")} className="flex-1 px-4 py-2 holo-text hover-arc bg-gray-700 rounded-full">Thrusters Down</button>
+                                </div>
+                                <div className="flex justify-between gap-2">
+                                    <button onClick={() => sendCommand("Pitch Up")} className="flex-1 px-4 py-2 holo-text hover-arc bg-gray-700 rounded-full">Pitch Up</button>
+                                    <button onClick={() => sendCommand("Pitch Down")} className="flex-1 px-4 py-2 holo-text hover-arc bg-gray-700 rounded-full">Pitch Down</button>
+                                </div>
+                                <div className="flex justify-between gap-2">
+                                    <button onClick={() => sendCommand("Roll Left")} className="flex-1 px-4 py-2 holo-text hover-arc bg-gray-700 rounded-full">Roll Left</button>
+                                    <button onClick={() => sendCommand("Roll Right")} className="flex-1 px-4 py-2 holo-text hover-arc bg-gray-700 rounded-full">Roll Right</button>
+                                </div>
+                                <div className="flex justify-between gap-2">
+                                    <button onClick={() => sendCommand("Yaw Left")} className="flex-1 px-4 py-2 holo-text hover-arc bg-gray-700 rounded-full">Yaw Left</button>
+                                    <button onClick={() => sendCommand("Yaw Right")} className="flex-1 px-4 py-2 holo-text hover-arc bg-gray-700 rounded-full">Yaw Right</button>
+                                </div>
+                                <div className="flex justify-between gap-2">
+                                    <button onClick={() => sendCommand("Sluggish")} className="flex-1 px-4 py-2 holo-text hover-arc bg-orange-600 rounded-full">Sluggish</button>
+                                    <button onClick={() => sendCommand("Neutral")} className="flex-1 px-4 py-2 holo-text hover-arc bg-orange-600 rounded-full">Neutral</button>
+                                    <button onClick={() => sendCommand("Agile")} className="flex-1 px-4 py-2 holo-text hover-arc bg-orange-600 rounded-full">Agile</button>
+                                </div>
+                                {modeConfirmation && (
+                                    <p className="text-center text-sm text-orange-400 mt-2 confirmation">{modeConfirmation}</p>
+                                )}
+                            </div>
+                        </section>
+
+                        {/* Telemetry & Propulsion */}
+                        <section className="bg-gray-800 bg-opacity-70 p-6 rounded-lg arc-reactor h-[calc(100vh-180px)] overflow-y-auto">
+                            <h2 className="text-xl holo-text mb-4 text-center">Flight Diagnostics</h2>
+                            <div className="space-y-4">
+                                <div>
+                                    <h3 className="text-lg holo-text mb-2">Orientation</h3>
+                                    <div className="grid grid-cols-2 gap-2 text-sm">
+                                        <div>Roll: <span className="text-orange-400">{telemetry.roll.toFixed(1)}°</span></div>
+                                        <div>Pitch: <span className="text-orange-400">{telemetry.pitch.toFixed(1)}°</span></div>
+                                        <div>Yaw: <span className="text-orange-400">{telemetry.yaw.toFixed(1)}°</span></div>
+                                        <div>Throttle: <span className="text-orange-400">{telemetry.throttle}%</span></div>
+                                    </div>
+                                </div>
+                                <div>
+                                    <h3 className="text-lg holo-text mb-2">Position</h3>
+                                    <div className="grid grid-cols-2 gap-2 text-sm">
+                                        <div>Height: <span className="text-orange-400">{telemetry.height.toFixed(2)}m</span></div>
+                                        <div>X: <span className="text-orange-400">{telemetry.x.toFixed(2)}m</span></div>
+                                        <div>Y: <span className="text-orange-400">{telemetry.y.toFixed(2)}m</span></div>
+                                        <div>Battery: <span className="text-orange-400">{telemetry.battery}%</span></div>
+                                    </div>
+                                </div>
+                                <div>
+                                    <h3 className="text-lg holo-text mb-2">Map</h3>
+                                    <div id="map"></div>
+                                </div>
+                                <div>
+                                    <h3 className="text-lg holo-text mb-2">Propulsion</h3>
+                                    <div className="space-y-2 text-sm">
+                                        {['m1', 'm2', 'm3', 'm4'].map((m, i) => (
+                                            <div key={m}>
+                                                M{i + 1}: <span className="text-orange-400">{Math.round(telemetry[m] / 655.35)}%</span>
+                                                <div className="w-full bg-gray-600 h-2 rounded">
+                                                    <div className="bg-orange-400 h-2 rounded" style={{ width: `${(telemetry[m] / 65535 * 100)}%` }}></div>
+                                                </div>
+                                            </div>
+                                        ))}
+                                    </div>
+                                </div>
+                            </div>
+                        </section>
+
+                        {/* Auto-Tuning & Status */}
+                        <section className="bg-gray-800 bg-opacity-70 p-6 rounded-lg arc-reactor h-[calc(100vh-180px)] overflow-y-auto">
+                            <h2 className="text-xl holo-text mb-4 text-center">System Status</h2>
+                            <div className="space-y-4">
+                                <div>
+                                    <h3 className="text-lg holo-text mb-2">Auto-Tuning</h3>
+                                    <div className="space-y-2 text-sm">
+                                        <div>Roll PID: <span className="text-orange-400">kp:{pidGains.roll.kp.toFixed(2)}, ki:{pidGains.roll.ki}, kd:{pidGains.roll.kd}</span></div>
+                                        <div>Pitch PID: <span className="text-orange-400">kp:{pidGains.pitch.kp.toFixed(2)}, ki:{pidGains.pitch.ki}, kd:{pidGains.pitch.kd}</span></div>
+                                        <div>Yaw PID: <span className="text-orange-400">kp:{pidGains.yaw.kp.toFixed(2)}, ki:{pidGains.yaw.ki}, kd:{pidGains.yaw.kd}</span></div>
+                                        <div>Height PID: <span className="text-orange-400">kp:{pidGains.height.kp.toFixed(2)}, ki:{pidGains.height.ki}, kd:{pidGains.height.kd}</span></div>
+                                        <div className="grid grid-cols-2 gap-2">
+                                            {motorTrim.map((trim, i) => (
+                                                <div key={i}>Trim M{i + 1}: <span className="text-orange-400">{trim}</span></div>
+                                            ))}
+                                        </div>
+                                    </div>
+                                </div>
+                                <div>
+                                    <h3 className="text-lg holo-text mb-2">MPU6050 Status</h3>
+                                    <p className={`text-sm ${mpuStatus === "Successful" ? "text-orange-400" : "text-red-400"}`}>
+                                        Calibration: {mpuStatus}
+                                    </p>
+                                </div>
+                                <div>
+                                    <h3 className="text-lg holo-text mb-2">Alerts</h3>
+                                    <ul className="text-sm text-red-400">
+                                        {telemetry.warnings.length ? telemetry.warnings.map((warn, idx) => (
+                                            <li key={idx}>{warn}</li>
+                                        )) : <li className="text-orange-400">Systems Optimal</li>}
+                                    </ul>
+                                </div>
+                            </div>
+                        </section>
+                    </div>
+
+                    {/* Mission Logs */}
+                    <section className="mt-6 bg-gray-800 bg-opacity-70 p-6 rounded-lg arc-reactor">
+                        <div className="flex justify-between items-center mb-4">
+                            <h2 className="text-xl holo-text">Mission Log</h2>
+                            <div className="space-x-3">
+                                <button
+                                    onClick={fetchLogs}
+                                    className="px-5 py-2 holo-text hover-arc bg-gray-700 rounded-full"
+                                >
+                                    Update Log
+                                </button>
+                                <button
+                                    onClick={downloadLog}
+                                    className="px-5 py-2 holo-text hover-arc bg-orange-600 rounded-full"
+                                >
+                                    Download Log
+                                </button>
+                            </div>
+                        </div>
+                        <div className="h-24 overflow-y-auto text-sm">
+                            {displayLogs.map((log, idx) => (
+                                <p key={idx} className="text-orange-400 border-b border-gray-600 py-1">{log}</p>
+                            ))}
+                        </div>
+                    </section>
+
+                    {/* Process Terminal */}
+                    <section className="mt-6 bg-gray-800 bg-opacity-70 p-6 rounded-lg arc-reactor">
+                        <h2 className="text-xl holo-text mb-4">Process Terminal</h2>
+                        <div ref={terminalRef} className="h-32 overflow-y-auto text-sm font-mono">
+                            {processLogs.map((log, idx) => (
+                                <p key={idx} className={`py-1 terminal-log-${log.type}`}>
+                                    [{log.timestamp}] {log.message}
+                                </p>
+                            ))}
+                        </div>
+                    </section>
+                </div>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<GroundControlStation />);
+    </script>
+</body>
+</html>
